@@ -4,7 +4,6 @@ import matplotlib.pyplot as plt
 from joblib import Parallel, delayed
 from scipy.io import loadmat
 
-
 # ============================================================
 # USER SETTINGS
 # ============================================================
@@ -106,7 +105,6 @@ elemE = 10.0 ** (pattern_dB / 20.0)
 phi_plot_deg = np.arange(-180.0, 180.0, 1.0)
 phi_full_deg = np.mod(phi_plot_deg, 360.0)
 phi_deg = phi_full_deg.copy()
-
 
 # ============================================================
 # HELPERS
