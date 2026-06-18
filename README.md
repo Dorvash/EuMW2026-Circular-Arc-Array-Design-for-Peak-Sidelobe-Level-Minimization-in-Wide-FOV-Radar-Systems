@@ -15,7 +15,7 @@
 
 ---
 
-⚙️ **Dependencies:**
+⚙️ **Requirements:**
 
 The script requires the following Python packages:
 
