@@ -90,11 +90,8 @@ N_JOBS = -1
 # ------------------------------------------------------------
 # Pattern file
 # ------------------------------------------------------------
-PATTERN_MAT_FILE = "xMSPatchPattern10.mat"
-PATTERN_VAR_NAME = "xMSPatchPattern10"
-
-
-
+PATTERN_MAT_FILE = "Physical_Element_Pattern.mat"
+PATTERN_VAR_NAME = "Physical_Element_Pattern"
 
 # ============================================================
 # LOAD ELEMENT PATTERN
