@@ -37,7 +37,7 @@ pip install numpy scipy cvxpy matplotlib joblib
 
 📖 **Manuscript Title:** *Circular Arc Array Design for Peak Sidelobe Level Minimization in Wide-FOV Radar Systems*  
 Published in **2026 European Microwave Week (EuMW)**.  
-DOI: *TBA*
+DOI: *10.23919/EuRAD69232.2026.11747655*
 
 ---
 
