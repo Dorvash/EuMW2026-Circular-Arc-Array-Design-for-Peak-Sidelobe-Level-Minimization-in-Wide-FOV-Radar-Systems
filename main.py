@@ -1,8 +1,23 @@
+import os
+
+# Single-threaded BLAS: the matrices are tiny (360 x 16), many BLAS
+# threads only add overhead. Has no effect if numpy was imported before.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
+import warnings
+
 import numpy as np
 import cvxpy as cp
 import matplotlib.pyplot as plt
-from joblib import Parallel, delayed
 from scipy.io import loadmat
+
+# cvxpy's "Solution may be inaccurate" warnings are handled by the
+# backtracking line search (a step is only accepted if the exact PSL
+# improves), so they are not printed
+warnings.filterwarnings("ignore", message="Solution may be inaccurate")
+
 
 # ============================================================
 # USER SETTINGS
@@ -82,9 +97,6 @@ STEP_NORM_TOL_BETA = 1e-7
 ENABLE_BETA_POLISH = True
 MAX_POLISH_SWEEPS = 3
 N_POLISH_SAMPLES = 11
-
-# Parallel workers
-N_JOBS = -1
 
 # ------------------------------------------------------------
 # Pattern file
@@ -168,6 +180,54 @@ def beta_from_eta_alpha(eta: np.ndarray, alpha_deg: float, R: float, d_min: floa
     return beta
 
 
+def compute_af_batch(
+    phi_deg_grid: np.ndarray,
+    beta_batch: np.ndarray,
+    R_batch,
+    c: float,
+    wavelength: float,
+    elemE: np.ndarray,
+    target_aoa_deg: np.ndarray,
+) -> np.ndarray:
+    """
+    Vectorized AF for a batch of geometries.
+    beta_batch : (B, m)
+    R_batch    : scalar or (B,)
+    returns    : (B, nphi, nbeams)
+    Same model as the original single-geometry routine.
+    """
+    phi_deg_grid = np.asarray(phi_deg_grid, dtype=float).reshape(-1)
+    target_aoa_deg = np.asarray(target_aoa_deg, dtype=float).reshape(-1)
+    beta_batch = np.atleast_2d(np.asarray(beta_batch, dtype=float))
+    B = beta_batch.shape[0]
+    R_col = np.broadcast_to(np.asarray(R_batch, dtype=float).reshape(-1, 1), (B, 1))
+
+    # geometry (same as build_geometry)
+    x_elem = -R_col + R_col * np.cos(beta_batch)          # (B, m)
+    y_elem = R_col * np.sin(beta_batch)                   # (B, m)
+    phi_elem_deg = np.rad2deg(beta_batch)                 # (B, m)
+
+    # rotated element patterns: np.roll(E, s)[i] == E[(i - s) mod N]
+    n_pat = elemE.size
+    idx = np.mod(np.round(phi_deg_grid).astype(int), 360)              # (nphi,)
+    shift = np.mod(np.round(phi_elem_deg).astype(int), 360)            # (B, m)
+    elem_pattern_rot = elemE[np.mod(idx[None, :, None] - shift[:, None, :], n_pat)]  # (B, nphi, m)
+
+    # steering weights
+    ang_tgt = np.deg2rad(target_aoa_deg)
+    tau_tgt = -(x_elem[:, :, None] * np.cos(ang_tgt)[None, None, :]
+                + y_elem[:, :, None] * np.sin(ang_tgt)[None, None, :]) / c   # (B, m, nb)
+    W = np.exp(1j * (2.0 * np.pi / wavelength) * c * tau_tgt)
+
+    # observation steering
+    ang_obs = np.deg2rad(phi_deg_grid)
+    tau_obs = -(np.cos(ang_obs)[None, :, None] * x_elem[:, None, :]
+                + np.sin(ang_obs)[None, :, None] * y_elem[:, None, :]) / c  # (B, nphi, m)
+
+    a = elem_pattern_rot * np.exp(1j * (2.0 * np.pi / wavelength) * c * tau_obs)
+    return np.matmul(np.conjugate(a), W)                  # (B, nphi, nb)
+
+
 def compute_af_on_grid_exact_multibeam(
     phi_deg_grid: np.ndarray,
     beta: np.ndarray,
@@ -177,35 +237,15 @@ def compute_af_on_grid_exact_multibeam(
     elemE: np.ndarray,
     target_aoa_deg: np.ndarray,
 ) -> np.ndarray:
-    phi_deg_grid = np.asarray(phi_deg_grid).reshape(-1)
-    target_aoa_deg = np.asarray(target_aoa_deg).reshape(-1)
+    return compute_af_batch(
+        phi_deg_grid, np.asarray(beta, dtype=float)[None, :], R, c, wavelength, elemE, target_aoa_deg
+    )[0]
 
-    nphi = phi_deg_grid.size
-    nbeams = target_aoa_deg.size
-    m = beta.size
 
-    x_elem, y_elem, z_elem, phi_elem_deg = build_geometry(beta, R)
-
-    idx = np.mod(np.round(phi_deg_grid).astype(int), 360)
-    elem_pattern_rot = np.zeros((nphi, m), dtype=float)
-
-    for k in range(m):
-        Eshift = rotate_pattern(elemE, phi_elem_deg[k])
-        elem_pattern_rot[:, k] = Eshift[idx]
-
-    W = np.zeros((m, nbeams), dtype=np.complex128)
-    for ib, aoa in enumerate(target_aoa_deg):
-        r_tgt = np.array([np.cos(np.deg2rad(aoa)), np.sin(np.deg2rad(aoa)), 0.0])
-        tau_tgt = -(x_elem * r_tgt[0] + y_elem * r_tgt[1] + z_elem * r_tgt[2]) / c
-        W[:, ib] = np.exp(1j * (2.0 * np.pi / wavelength) * c * tau_tgt)
-
-    r_obs_x = np.cos(np.deg2rad(phi_deg_grid))[:, None]
-    r_obs_y = np.sin(np.deg2rad(phi_deg_grid))[:, None]
-    tau_obs = -(r_obs_x * x_elem[None, :] + r_obs_y * y_elem[None, :]) / c
-
-    a = elem_pattern_rot * np.exp(1j * (2.0 * np.pi / wavelength) * c * tau_obs)
-    AF = np.conjugate(a) @ W
-    return AF
+def af_batch_to_vec(AF_batch: np.ndarray) -> np.ndarray:
+    """(B, nphi, nb) -> (B, nphi*nb), same as AF.reshape(-1, order='F') per item."""
+    B = AF_batch.shape[0]
+    return np.transpose(AF_batch, (0, 2, 1)).reshape(B, -1)
 
 
 def find_mainbeam_bounds_null_to_null(
@@ -288,7 +328,10 @@ def evaluate_exact_af_and_psl(
     AF = compute_af_on_grid_exact_multibeam(
         phi_deg_grid, beta, R, C, LAMBDA, elemE, target_aoa_deg
     )
+    return psl_from_af(AF, phi_plot_deg, target_aoa_deg)
 
+
+def psl_from_af(AF: np.ndarray, phi_plot_deg: np.ndarray, target_aoa_deg: np.ndarray):
     P_dB = 20.0 * np.log10(np.abs(AF) + np.finfo(float).eps)
 
     nphi, nbeams = P_dB.shape
@@ -388,15 +431,11 @@ def recover_R_and_arcspan_from_xy(x_elem: np.ndarray, y_elem: np.ndarray):
 # SYMMETRIC LS JACOBIANS
 # ============================================================
 def symmetric_ls_scalar_jacobian(
-    beta_ref: np.ndarray,
-    R_ref: float,
+    AF0: np.ndarray,
     alpha_current_deg: float,
     eta: np.ndarray,
     mu_alpha_deg: float,
 ):
-    AF0 = compute_af_on_grid_exact_multibeam(
-        phi_full_deg, beta_ref, R_ref, C, LAMBDA, elemE, TARGET_AOA_DEG
-    )
     AF0_vec = AF0.reshape(-1, order="F")
 
     t_samples = np.linspace(-mu_alpha_deg, mu_alpha_deg, N_SAMPLES_ALPHA)
@@ -409,29 +448,30 @@ def symmetric_ls_scalar_jacobian(
     if denom < 1e-20:
         return AF0, np.zeros_like(AF0_vec)
 
-    num = np.zeros(AF0_vec.size, dtype=np.complex128)
-
-    for q, t in enumerate(t_samples):
+    beta_list = []
+    R_list = []
+    for t in t_samples:
         alpha_tmp = float(np.clip(alpha_current_deg + t, ALPHA_MIN_DEG, ALPHA_MAX_DEG))
         R_tmp = alpha_to_R(alpha_tmp, D_MIN, M)
-        beta_tmp = beta_from_eta_alpha(eta, alpha_tmp, R_tmp, D_MIN)
+        beta_list.append(beta_from_eta_alpha(eta, alpha_tmp, R_tmp, D_MIN))
+        R_list.append(R_tmp)
 
-        AFtmp = compute_af_on_grid_exact_multibeam(
-            phi_full_deg, beta_tmp, R_tmp, C, LAMBDA, elemE, TARGET_AOA_DEG
-        ).reshape(-1, order="F")
+    AF_vec = af_batch_to_vec(compute_af_batch(
+        phi_full_deg, np.array(beta_list), np.array(R_list), C, LAMBDA, elemE, TARGET_AOA_DEG
+    ))                                                    # (Q, nvec)
 
-        num += w_ls[q] * t * (AFtmp - AF0_vec)
-
+    num = (w_ls * t_samples) @ (AF_vec - AF0_vec[None, :])
     Jalpha = num / denom
     return AF0, Jalpha
 
-def symmetric_ls_beta_column_worker(
-    k: int,
+
+def symmetric_ls_beta_jacobian(
     beta_bar: np.ndarray,
     AF0_vec: np.ndarray,
     mu_beta_local: float,
     R: float,
 ):
+    """All M columns at once: (nvec, M). Replaces the joblib column workers."""
     t_samples = np.linspace(-mu_beta_local, mu_beta_local, N_SAMPLES_BETA)
     t_samples = t_samples[np.abs(t_samples) >= 1e-14]
 
@@ -439,22 +479,38 @@ def symmetric_ls_beta_column_worker(
     w_ls = np.exp(-(t_samples ** 2) / (2.0 * sigma ** 2))
 
     denom = np.sum(w_ls * (t_samples ** 2))
+    m = beta_bar.size
     if denom < 1e-20:
-        return np.zeros(AF0_vec.size, dtype=np.complex128)
+        return np.zeros((AF0_vec.size, m), dtype=np.complex128)
 
-    num = np.zeros(AF0_vec.size, dtype=np.complex128)
+    Q = t_samples.size
+    beta_batch = np.broadcast_to(beta_bar, (m, Q, m)).copy()   # [k, q, :]
+    kk = np.arange(m)
+    beta_batch[kk, :, kk] += t_samples[None, :]
 
-    for iq, t in enumerate(t_samples):
-        beta_tmp = beta_bar.copy()
-        beta_tmp[k] += t
+    AF_vec = af_batch_to_vec(compute_af_batch(
+        phi_full_deg, beta_batch.reshape(m * Q, m), R, C, LAMBDA, elemE, TARGET_AOA_DEG
+    )).reshape(m, Q, -1)                                  # (m, Q, nvec)
 
-        AF_tmp = compute_af_on_grid_exact_multibeam(
-            phi_full_deg, beta_tmp, R, C, LAMBDA, elemE, TARGET_AOA_DEG
-        ).reshape(-1, order="F")
-
-        num += w_ls[iq] * t * (AF_tmp - AF0_vec)
-
+    num = np.einsum("q,kqv->vk", w_ls * t_samples, AF_vec - AF0_vec[None, None, :])
     return num / denom
+
+
+# ============================================================
+# VECTORIZED MINIMAX SOCP
+#   min rho  s.t.  |a0_k + a_k^T x| <= rho  for all sidelobe samples k
+# One SOC cone block instead of thousands of separate cp.abs constraints
+# (the original per-row loop made CVXPY compilation ~40x slower).
+# ============================================================
+def sidelobe_soc_constraint(A0_stack: np.ndarray, A_stack: np.ndarray, x, rho):
+    if A_stack.ndim == 1:
+        re = A0_stack.real + A_stack.real * x
+        im = A0_stack.imag + A_stack.imag * x
+    else:
+        re = A0_stack.real + A_stack.real @ x
+        im = A0_stack.imag + A_stack.imag @ x
+    K = A0_stack.size
+    return cp.SOC(rho * np.ones(K), cp.vstack([re, im]), axis=0)
 
 
 # ============================================================
@@ -501,18 +557,23 @@ def polish_beta_coordinates(beta_init: np.ndarray, R: float):
             local_best_beta = beta_best.copy()
             local_best_psl = psl_best
 
+            beta_tries = []
             for val in samples:
                 beta_try = beta_best.copy()
                 beta_try[k] = val
-                beta_try = project_beta_feasible(beta_try, R, D_MIN)
+                beta_tries.append(project_beta_feasible(beta_try, R, D_MIN))
+            beta_tries = np.array(beta_tries)
 
-                _, _, psl_try, _, _, _ = evaluate_exact_af_and_psl(
-                    beta_try, R, phi_full_deg, phi_plot_deg, TARGET_AOA_DEG
-                )
+            AF_tries = compute_af_batch(
+                phi_full_deg, beta_tries, R, C, LAMBDA, elemE, TARGET_AOA_DEG
+            )
+
+            for j in range(beta_tries.shape[0]):
+                _, _, psl_try, _, _, _ = psl_from_af(AF_tries[j], phi_plot_deg, TARGET_AOA_DEG)
 
                 if psl_try < local_best_psl - 1e-10:
                     local_best_psl = psl_try
-                    local_best_beta = beta_try.copy()
+                    local_best_beta = beta_tries[j].copy()
 
             if local_best_psl < psl_best - 1e-10:
                 beta_best = local_best_beta.copy()
@@ -551,12 +612,12 @@ def optimize_alpha_block(beta_init: np.ndarray, R_init: float, mu_alpha_deg: flo
     for _ in range(MAX_ITER_ALPHA):
         eta = get_shape_eta(beta_current)
 
-        AF0, Jalpha = symmetric_ls_scalar_jacobian(
-            beta_current, R_current, alpha_current_deg, eta, mu_alpha_deg
+        AF0, _, _, _, side_masks, _ = evaluate_exact_af_and_psl(
+            beta_current, R_current, phi_full_deg, phi_plot_deg, TARGET_AOA_DEG
         )
 
-        _, _, _, _, side_masks, _ = evaluate_exact_af_and_psl(
-            beta_current, R_current, phi_full_deg, phi_plot_deg, TARGET_AOA_DEG
+        AF0, Jalpha = symmetric_ls_scalar_jacobian(
+            AF0, alpha_current_deg, eta, mu_alpha_deg
         )
 
         A0_stack, J_stack = build_sidelobe_stack(AF0, Jalpha, side_masks)
@@ -569,10 +630,8 @@ def optimize_alpha_block(beta_init: np.ndarray, R_init: float, mu_alpha_deg: flo
             alpha_current_deg + DeltaAlpha <= ALPHA_MAX_DEG,
             DeltaAlpha >= -mu_alpha_deg,
             DeltaAlpha <= +mu_alpha_deg,
+            sidelobe_soc_constraint(A0_stack, J_stack, DeltaAlpha, rho),
         ]
-
-        for k in range(A0_stack.size):
-            constraints.append(cp.abs(A0_stack[k] + J_stack[k] * DeltaAlpha) <= rho)
 
         problem = cp.Problem(cp.Minimize(rho), constraints)
 
@@ -673,11 +732,7 @@ def optimize_beta_block(beta_init: np.ndarray, R: float):
         )
         AF0_vec = AF0.reshape(-1, order="F")
 
-        J_cols = Parallel(n_jobs=N_JOBS, verbose=0)(
-            delayed(symmetric_ls_beta_column_worker)(k, beta_bar, AF0_vec, mu_beta, R)
-            for k in range(M)
-        )
-        Jfull = np.column_stack(J_cols)
+        Jfull = symmetric_ls_beta_jacobian(beta_bar, AF0_vec, mu_beta, R)
 
         if (not np.all(np.isfinite(Jfull))) or (not np.all(np.isfinite(AF0_vec))):
             break
@@ -688,16 +743,12 @@ def optimize_beta_block(beta_init: np.ndarray, R: float):
         rho = cp.Variable(nonneg=True)
 
         beta_new = beta_bar + DeltaBeta
-        constraints = []
-
-        for k in range(A0_stack.size):
-            constraints.append(cp.abs(A0_stack[k] + A_stack[k, :] @ DeltaBeta) <= rho)
-
-        for k in range(M - 1):
-            constraints.append(beta_new[k + 1] - beta_new[k] >= delta_beta_min)
-
-        constraints.append(DeltaBeta >= -mu_beta)
-        constraints.append(DeltaBeta <= +mu_beta)
+        constraints = [
+            sidelobe_soc_constraint(A0_stack, A_stack, DeltaBeta, rho),
+            cp.diff(beta_new) >= delta_beta_min,
+            DeltaBeta >= -mu_beta,
+            DeltaBeta <= +mu_beta,
+        ]
 
         prob = cp.Problem(cp.Minimize(rho), constraints)
 
